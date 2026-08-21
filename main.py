@@ -19,7 +19,6 @@ from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.base_transport import TransportParams
-from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 from llm_config import model
 
@@ -56,20 +55,7 @@ voice_agent = LangchainProcessor(RunnableLambda(ask_deep_agent))
 async def bot(runner_args):
     transport = await create_transport(
         runner_args,
-        {
-            "webrtc": lambda: TransportParams(
-                audio_in_enabled=True, audio_out_enabled=True
-            ),
-            # Twilio Media Streams use 8kHz audio. The serializer/add_wav_header
-            # are set automatically by create_transport() for telephony.
-            "twilio": lambda: FastAPIWebsocketParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                audio_in_sample_rate=8000,
-                audio_out_sample_rate=8000,
-                vad_analyzer=SileroVADAnalyzer(),
-            ),
-        },
+        {"webrtc": lambda: TransportParams(audio_in_enabled=True, audio_out_enabled=True)},
     )
 
     stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
@@ -111,16 +97,6 @@ async def bot(runner_args):
 
 
 if __name__ == "__main__":
-    import sys
-
     from pipecat.runner.run import main
-
-    # Render (and most PaaS hosts) assign the listen port via $PORT and expect
-    # the process to bind 0.0.0.0 so their proxy can reach it. The pipecat
-    # runner defaults to localhost:7860, which would leave health checks
-    # hanging until Render times the deploy out. Inject --host/--port ahead
-    # of parsing unless the user already passed them explicitly on the CLI.
-    if "--host" not in sys.argv and "--port" not in sys.argv:
-        sys.argv += ["--host", "0.0.0.0", "--port", os.environ.get("PORT", "7860")]
 
     main()
