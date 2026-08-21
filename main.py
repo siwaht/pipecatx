@@ -68,7 +68,26 @@ async def ask_deep_agent(data: dict[str, str]) -> str:
 voice_agent = LangchainProcessor(RunnableLambda(ask_deep_agent))
 
 
+def _missing_env(*names: str) -> list[str]:
+    """Return which of the given environment variables are unset or empty."""
+    return [name for name in names if not os.environ.get(name)]
+
+
 async def bot(runner_args):
+    # bot() runs as a FastAPI background task, so an exception in here never
+    # reaches the browser: the client just sits there "connected" while nothing
+    # happens. .env is gitignored, so on Render these must be set in the
+    # dashboard's Environment section. Fail loudly in the log instead.
+    logger.info(f"bot task started ({type(runner_args).__name__})")
+    missing = _missing_env("DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY")
+    if missing:
+        logger.error(
+            "Cannot start the bot: missing environment variable(s) {}. "
+            "Set them in the Render dashboard (Environment) and redeploy.",
+            ", ".join(missing),
+        )
+        return
+
     transport = await create_transport(
         runner_args,
         {
@@ -118,10 +137,19 @@ async def bot(runner_args):
     )
     task = PipelineTask(pipeline)
 
+    # If "media connected" never appears in the log after the browser says it
+    # connected, the SDP exchange succeeded but the WebRTC media path did not:
+    # that is a network/ICE problem, not an application problem.
+    @transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        logger.info("media connected: audio is flowing, pipeline is live")
+
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
+        logger.info("media disconnected: cancelling pipeline task")
         await task.cancel()
 
+    logger.info("running pipeline, waiting for media to connect")
     await PipelineRunner(handle_sigint=runner_args.handle_sigint).run(task)
 
 
