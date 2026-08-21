@@ -1,0 +1,8 @@
+langchain
+langgraph
+deepagents
+langchain-openai
+langchain-text-splitters
+python-dotenv
+elevenlabs
+langchain-quickjs
