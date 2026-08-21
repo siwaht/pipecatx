@@ -1531,15 +1531,15 @@ wheels = [
 
 [[package]]
 name = "livekit-protocol"
-version = "1.1.22"
+version = "1.1.24"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "protobuf" },
     { name = "types-protobuf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9b/65/736a378c2bf89c7fb54c1ff996f0bdc2046c588029d42afa2531b04c717d/livekit_protocol-1.1.22.tar.gz", hash = "sha256:a6517fd4ecea01ccd5055a30caefedc69a3e9ee02f715a79409b671091606692", size = 122570, upload-time = "2026-08-04T20:15:36.285Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d7/dc/65c106d689916e78e47d79d4f890f6e83b680442c67ed4909b44425084ea/livekit_protocol-1.1.24.tar.gz", hash = "sha256:b0a5699d3a4c4e42c3d37416dc3ed3c817c527c317c4cf3351d0bbe52887b9d4", size = 122624, upload-time = "2026-08-20T22:07:24.06Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/61/af/343dcfc7e429fbbc30993a733efb7fbfbbae70ac035a52e44111c6f4a76b/livekit_protocol-1.1.22-py3-none-any.whl", hash = "sha256:5c2edc843a48fe21d05b82c637c3e9eb92a88a34ba1e2c39857aca0e6105a84f", size = 149401, upload-time = "2026-08-04T20:15:35.073Z" },
+    { url = "https://files.pythonhosted.org/packages/88/1f/e06cbbaea37bbe12cab1d169767f3fff9b385b019e6bdcd02fb9c94df63d/livekit_protocol-1.1.24-py3-none-any.whl", hash = "sha256:794463c4ed209fc884194470595052de652477d92b10d81bb5b0f9dcf53050f9", size = 149448, upload-time = "2026-08-20T22:07:22.699Z" },
 ]
 
 [[package]]
@@ -2128,9 +2128,6 @@ webrtc = [
     { name = "aiortc" },
     { name = "opencv-python-headless" },
 ]
-websocket = [
-    { name = "fastapi" },
-]
 
 [[package]]
 name = "pipecat-ai-prebuilt"
@@ -2156,7 +2153,7 @@ dependencies = [
     { name = "langchain-quickjs" },
     { name = "langchain-text-splitters" },
     { name = "langgraph" },
-    { name = "pipecat-ai", extra = ["deepgram", "langchain", "livekit", "runner", "webrtc", "websocket"] },
+    { name = "pipecat-ai", extra = ["deepgram", "langchain", "livekit", "runner", "webrtc"] },
     { name = "python-dotenv" },
 ]
 
@@ -2169,7 +2166,7 @@ requires-dist = [
     { name = "langchain-quickjs", specifier = "==0.3.5" },
     { name = "langchain-text-splitters", specifier = "==1.1.2" },
     { name = "langgraph", specifier = "==1.2.11" },
-    { name = "pipecat-ai", extras = ["deepgram", "elevenlabs", "langchain", "livekit", "runner", "silero", "webrtc", "websocket"], specifier = "==1.7.0" },
+    { name = "pipecat-ai", extras = ["deepgram", "elevenlabs", "langchain", "livekit", "runner", "silero", "webrtc"], specifier = "==1.7.0" },
     { name = "python-dotenv", specifier = "==1.2.3" },
 ]
 
@@ -2998,11 +2995,11 @@ wheels = [
 
 [[package]]
 name = "types-protobuf"
-version = "7.34.1.20260816"
+version = "7.35.1.20260821"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e0/86/f592845ff8410583687e6dbf985a028e6ec6d378d0bdf548817aa39937b9/types_protobuf-7.34.1.20260816.tar.gz", hash = "sha256:6f43846e7a3cc2621abfa79e2bb03461e6769a74cdae7462efaddf84580fd5c1", size = 69170, upload-time = "2026-08-16T02:50:00.998Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/14/58/8013cfe1a9665ad36a000897054bfd499f56e89a56b7542838c2f4e6c737/types_protobuf-7.35.1.20260821.tar.gz", hash = "sha256:abc85e9271f9774f4899201dbfb731ef4a453f302454fdb66091a557b2adb2ac", size = 69632, upload-time = "2026-08-21T02:52:33.913Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/14/cc/909e791f11de77c2073007dbcce8b502865ef12c7881bdf36b0ccb206ab4/types_protobuf-7.34.1.20260816-py3-none-any.whl", hash = "sha256:2e3a225b3c21f0022daa34cec155f03858bb9aff9792947b8e71f0e9f1791fdb", size = 86036, upload-time = "2026-08-16T02:49:59.807Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/e7/18a03d8e31f3d90af5bf6c622fef3cd7b246773b11fdebb6c801c7a9fdd9/types_protobuf-7.35.1.20260821-py3-none-any.whl", hash = "sha256:a99b71356e153e53cc7bc3c8c0e22d8aa54d92f02bf02486f7a19a3a947caf03", size = 86413, upload-time = "2026-08-21T02:52:33.016Z" },
 ]
 
 [[package]]

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Voice agent</title>
+    <title>PipecatX Voice Agent</title>
     <style>
       :root { color-scheme: light dark; }
       body {
@@ -26,8 +26,8 @@
   </head>
   <body>
     <main>
-      <h1>Voice agent</h1>
-      <p>Connects over LiveKit, so it works from anywhere the browser has internet.</p>
+      <h1>PipecatX Voice Agent</h1>
+      <p>Connect to start a secure voice session.</p>
       <button id="connect">Connect</button>
       <button id="disconnect" hidden>Disconnect</button>
       <p id="status" role="status" aria-live="polite">Idle.</p>
@@ -37,7 +37,6 @@
     <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.15.7/dist/livekit-client.umd.min.js"></script>
     <script>
       const { Room, RoomEvent, ConnectionState } = LivekitClient;
-
       const connectBtn = document.getElementById("connect");
       const disconnectBtn = document.getElementById("disconnect");
       const statusEl = document.getElementById("status");
@@ -54,54 +53,54 @@
         connectBtn.disabled = true;
         setStatus("Requesting a room...");
         try {
-          const res = await fetch("/livekit/connect", { method: "POST" });
-          if (!res.ok) {
-            const body = await res.json().catch(() => ({}));
-            throw new Error(body.detail || `${res.status} ${res.statusText}`);
+          const response = await fetch("/livekit/connect", { method: "POST" });
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.detail || `${response.status} ${response.statusText}`);
           }
-          const { url, token, room: roomName } = await res.json();
+          const { url, token, room: roomName } = await response.json();
           log(`room ${roomName}`);
 
           room = new Room({ adaptiveStream: true, dynacast: true });
-
           room.on(RoomEvent.TrackSubscribed, (track) => {
             if (track.kind !== "audio") return;
-            const el = track.attach();
-            el.autoplay = true;
-            document.body.appendChild(el);
-            audioEls.add(el);
-            log("agent audio track attached");
-          });
-          room.on(RoomEvent.ParticipantConnected, (p) => log(`joined: ${p.identity}`));
-          room.on(RoomEvent.Disconnected, () => {
-            setStatus("Disconnected.");
-            cleanup();
+            const element = track.attach();
+            element.autoplay = true;
+            document.body.appendChild(element);
+            audioEls.add(element);
+            log("agent audio connected");
           });
           room.on(RoomEvent.ConnectionStateChanged, (state) => {
             log(`connection: ${state}`);
             if (state === ConnectionState.Connected) {
               setStatus("Connected. Start talking.");
+              disconnectBtn.hidden = false;
             }
           });
+          room.on(RoomEvent.Disconnected, () => {
+            setStatus("Disconnected.");
+            cleanup();
+          });
 
-          setStatus("Connecting to LiveKit...");
+          setStatus("Connecting to agent...");
           await room.connect(url, token);
-
-          // Autoplay policies need a user gesture; we are inside a click.
           await room.startAudio();
-          await room.localParticipant.setMicrophoneEnabled(true);
-          log("microphone published");
-
-          disconnectBtn.hidden = false;
-        } catch (err) {
-          setStatus(`Failed: ${err.message}`);
-          log(`error: ${err.message}`);
-          connectBtn.disabled = false;
+          try {
+            await room.localParticipant.setMicrophoneEnabled(true);
+            log("microphone published");
+          } catch (microphoneError) {
+            setStatus("Connected, but no microphone was found.");
+            log(`microphone unavailable: ${microphoneError.message}`);
+          }
+        } catch (error) {
+          setStatus(`Failed: ${error.message}`);
+          log(`error: ${error.message}`);
+          cleanup();
         }
       }
 
       function cleanup() {
-        for (const el of audioEls) el.remove();
+        for (const element of audioEls) element.remove();
         audioEls.clear();
         room = null;
         connectBtn.disabled = false;

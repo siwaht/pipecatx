@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import uuid
 from pathlib import Path
 
@@ -30,89 +31,64 @@ from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.livekit.transport import LiveKitParams
-from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+from pipecat.turns.user_stop import SpeechTimeoutUserTurnStopStrategy
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
 
 from llm_config import model
 
 load_dotenv()
 
 
-# Render's health check only needs a cheap HTTP 200. Register these on the
-# runner's FastAPI app at import time so they answer as soon as uvicorn is
-# listening: no Deepgram/ElevenLabs/Cloudflare calls, no Silero download, no
-# websocket. The runner's own "/" is a redirect to the prebuilt client for
-# webrtc and a webhook handler (POST) for telephony, so /healthz is the route
-# to point Render's health check at.
 @app.get("/healthz", include_in_schema=False)
-@app.get("/health", include_in_schema=False)
 async def health():
-    """Liveness/readiness probe. Must never block or touch external services."""
     return {"status": "ok"}
 
 
-# --- LiveKit path: the transport that actually works behind Render ----------
-#
-# The built-in SmallWebRTC transport is peer-to-peer: the browser has to reach
-# this process directly over UDP for media. Render web services are only
-# reachable on 443/HTTPS and the container has no public IP, so the SDP
-# exchange succeeds (the UI says "connected") and then media never establishes.
-#
-# With LiveKit, both the browser and this process connect *outbound* to LiveKit
-# Cloud, which relays the media. Nothing needs to reach us on UDP, so it works
-# unchanged on Render. Requires LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
-
-# Keep strong references to in-flight bot tasks so they aren't garbage
-# collected mid-call.
 _bot_tasks: set[asyncio.Task] = set()
 
 
 @app.get("/livekit", include_in_schema=False)
 async def livekit_client_page():
-    """Serve the minimal browser client for the LiveKit path."""
     return FileResponse(Path(__file__).parent / "livekit_client.html")
 
 
 @app.post("/livekit/connect", include_in_schema=False)
 async def livekit_connect():
-    """Create a room, start the bot in it, and return client credentials."""
-    url = os.environ.get("LIVEKIT_URL")
-    api_key = os.environ.get("LIVEKIT_API_KEY")
-    api_secret = os.environ.get("LIVEKIT_API_SECRET")
-    missing = _missing_env("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+    required = ("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+    missing = [name for name in required if not os.environ.get(name)]
     if missing:
-        detail = f"Missing environment variable(s): {', '.join(missing)}"
-        logger.error(detail)
-        raise HTTPException(status_code=503, detail=detail)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Missing environment variable(s): {', '.join(missing)}",
+        )
 
     room_name = f"pipecatx-{uuid.uuid4().hex[:12]}"
+    livekit_url = os.environ["LIVEKIT_URL"]
+    api_key = os.environ["LIVEKIT_API_KEY"]
+    api_secret = os.environ["LIVEKIT_API_SECRET"]
+
     agent_token = generate_token_with_agent(
         room_name, "Pipecat Agent", api_key, api_secret
     )
     user_token = generate_token(room_name, "User", api_key, api_secret)
-
-    runner_args = LiveKitRunnerArguments(
-        room_name=room_name, url=url, token=agent_token
+    task = asyncio.create_task(
+        bot(
+            LiveKitRunnerArguments(
+                room_name=room_name,
+                url=livekit_url,
+                token=agent_token,
+            )
+        )
     )
-    task = asyncio.create_task(bot(runner_args))
     _bot_tasks.add(task)
 
-    def _on_bot_done(finished: asyncio.Task) -> None:
-        # Without this, a crash inside bot() is discarded silently and the
-        # browser just sits in a room with no agent in it.
+    def clear_finished_task(finished: asyncio.Task) -> None:
         _bot_tasks.discard(finished)
-        if finished.cancelled():
-            logger.info(f"bot task cancelled, room={room_name}")
-            return
-        exc = finished.exception()
-        if exc:
-            logger.opt(exception=exc).error(f"bot task failed, room={room_name}")
-        else:
-            logger.info(f"bot task finished, room={room_name}")
+        if not finished.cancelled() and (error := finished.exception()):
+            logger.opt(exception=error).error("LiveKit bot task failed")
 
-    task.add_done_callback(_on_bot_done)
-
-    logger.info(f"LiveKit session requested, room={room_name}")
-    return {"url": url, "token": user_token, "room": room_name}
+    task.add_done_callback(clear_finished_task)
+    return {"url": livekit_url, "token": user_token, "room": room_name}
 
 
 @tool
@@ -121,7 +97,6 @@ def get_weather(city: str):
     return f"The weather of {city} is 16 degrees Celsius and rainy."
 
 
-# Your existing LangChain Deep Agent.
 agent = create_deep_agent(
     model=model,
     tools=[get_weather],
@@ -129,46 +104,28 @@ agent = create_deep_agent(
 )
 
 
-# Pipecat gives this function {"input": "what is the weather in New York?"}.
-# It returns one final string for the TTS service to speak.
 async def ask_deep_agent(data: dict[str, str]) -> str:
-    result = await agent.ainvoke(
-        {"messages": [HumanMessage(content=data["input"])]}
-    )
-    return str(result["messages"][-1].content)
-
-
-def make_voice_agent() -> LangchainProcessor:
-    """Build a fresh Pipecat <-> Deep Agent adapter for one session.
-
-    This must not be a module-level singleton. A FrameProcessor is stateful:
-    the pipeline links it to its neighbours and attaches a clock, a task
-    manager, and event handlers during setup. Reusing one instance across
-    sessions means the second caller re-links a processor that is still wired
-    into the first caller's pipeline. The Deep Agent itself is safe to share,
-    so only the processor is rebuilt.
-    """
-    return LangchainProcessor(RunnableLambda(ask_deep_agent))
-
-
-def _missing_env(*names: str) -> list[str]:
-    """Return which of the given environment variables are unset or empty."""
-    return [name for name in names if not os.environ.get(name)]
+    started_at = time.perf_counter()
+    try:
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=data["input"])]}
+        )
+        return str(result["messages"][-1].content)
+    finally:
+        logger.info(
+            "DeepAgent request completed in {:.2f}s",
+            time.perf_counter() - started_at,
+        )
 
 
 async def bot(runner_args):
-    # bot() runs off to the side of the HTTP request, so an exception in here
-    # never reaches the browser: the client just sits there "connected" while
-    # nothing happens. .env is gitignored and never ships, so on any host these
-    # must be set in that platform's environment settings. Fail loudly instead.
-    logger.info(f"bot task started ({type(runner_args).__name__})")
-    missing = _missing_env("DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY")
+    missing = [
+        name
+        for name in ("DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY")
+        if not os.environ.get(name)
+    ]
     if missing:
-        logger.error(
-            "Cannot start the bot: missing environment variable(s) {}. "
-            "Set them in your host's environment settings and redeploy.",
-            ", ".join(missing),
-        )
+        logger.error("Missing environment variable(s): {}", ", ".join(missing))
         return
 
     transport = await create_transport(
@@ -177,95 +134,73 @@ async def bot(runner_args):
             "webrtc": lambda: TransportParams(
                 audio_in_enabled=True, audio_out_enabled=True
             ),
-            # LiveKit relays media through LiveKit Cloud, so this is the
-            # transport to use on a PaaS host. See /livekit above.
             "livekit": lambda: LiveKitParams(
                 audio_in_enabled=True, audio_out_enabled=True
-            ),
-            # Twilio Media Streams use 8kHz audio. The serializer/add_wav_header
-            # are set automatically by create_transport() for telephony.
-            #
-            # No vad_analyzer here: as of Pipecat 1.x, VAD lives on the user
-            # context aggregator (see LLMUserAggregatorParams below), not on
-            # transport params. TransportParams has no such field and pydantic
-            # would silently drop it, loading a Silero model for nothing.
-            "twilio": lambda: FastAPIWebsocketParams(
-                audio_in_enabled=True,
-                audio_out_enabled=True,
-                audio_in_sample_rate=8000,
-                audio_out_sample_rate=8000,
             ),
         },
     )
 
     stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
-
-    # Override this in .env with your own ElevenLabs voice ID if you want.
-    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
-
     tts = ElevenLabsTTSService(
         api_key=os.environ["ELEVENLABS_API_KEY"],
-        settings=ElevenLabsTTSService.Settings(voice=voice_id),
+        settings=ElevenLabsTTSService.Settings(
+            voice=os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
+        ),
     )
 
-
-    context = LLMContext()
     user_context, assistant_context = LLMContextAggregatorPair(
-        context,
-        # Detects when the user has stopped speaking.
-        user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
+        LLMContext(),
+        user_params=LLMUserAggregatorParams(
+            vad_analyzer=SileroVADAnalyzer(),
+            user_turn_strategies=UserTurnStrategies(
+                stop=[
+                    SpeechTimeoutUserTurnStopStrategy(
+                        user_speech_timeout=0.4,
+                    )
+                ]
+            ),
+        ),
     )
-
-    # One adapter per session. See make_voice_agent().
-    voice_agent = make_voice_agent()
+    voice_agent = LangchainProcessor(RunnableLambda(ask_deep_agent))
 
     pipeline = Pipeline(
         [
-            transport.input(),  # microphone audio
-            stt,  # speech -> text
-            user_context,  # waits for the end of the user's turn
-            voice_agent,  # text -> your Deep Agent -> reply text
-            tts,  # reply text -> speech
-            transport.output(),  # speaker audio
-            assistant_context,  # save the reply in Pipecat's context
+            transport.input(),
+            stt,
+            user_context,
+            voice_agent,
+            tts,
+            transport.output(),
+            assistant_context,
         ]
     )
     task = PipelineTask(pipeline)
 
-    greeting = "Hi, I'm your voice assistant. What can I do for you?"
-
-    # LiveKitTransport and the WebRTC/websocket transports expose different
-    # event names, so register against whichever one we actually built.
     if isinstance(runner_args, LiveKitRunnerArguments):
 
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant_id):
-            logger.info(f"media connected: participant {participant_id} joined")
-            # LangchainProcessor passes this through as the chain's session_id.
-            # Without it every session shares a None key.
             voice_agent.set_participant_id(participant_id)
-            await task.queue_frame(TTSSpeakFrame(greeting))
+            await task.queue_frame(
+                TTSSpeakFrame("Hi, I'm your voice assistant. What can I do for you?")
+            )
 
         @transport.event_handler("on_participant_disconnected")
         async def on_participant_disconnected(transport, participant_id):
-            logger.info("media disconnected: cancelling pipeline task")
             await task.cancel()
 
     else:
-        # If "media connected" never appears after the browser says it
-        # connected, the SDP exchange succeeded but the WebRTC media path did
-        # not: that is a network/ICE problem, not an application problem.
+
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
-            logger.info("media connected: audio is flowing, pipeline is live")
-            await task.queue_frame(TTSSpeakFrame(greeting))
+            await task.queue_frame(
+                TTSSpeakFrame("Hi, I'm your voice assistant. What can I do for you?")
+            )
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
-            logger.info("media disconnected: cancelling pipeline task")
             await task.cancel()
 
-    logger.info("running pipeline, waiting for media to connect")
     await PipelineRunner(handle_sigint=runner_args.handle_sigint).run(task)
 
 
@@ -274,25 +209,7 @@ if __name__ == "__main__":
 
     from pipecat.runner.run import main
 
-    # Render (and most PaaS hosts) assign the listen port via $PORT and expect
-    # the process to bind 0.0.0.0 so their proxy can reach it. The pipecat
-    # runner defaults to localhost:7860 and never reads $PORT, which leaves the
-    # health check hanging until Render times the deploy out.
-    #
-    # This is gated on $PORT being set, which is true on Render and false on a
-    # dev machine. Locally the runner keeps its own default and prints a
-    # browsable http://localhost:7860 URL. Binding 0.0.0.0 locally works too,
-    # but the URL the runner then prints is not reachable in a browser:
-    # 0.0.0.0 is a bind-any address, not a destination, so Chrome rejects it
-    # with ERR_ADDRESS_INVALID.
-    #
-    # Do not remove the $PORT handling: dropping it is what made the deploy
-    # after 3421846 time out.
     port = os.environ.get("PORT")
     if port and "--host" not in sys.argv and "--port" not in sys.argv:
         sys.argv += ["--host", "0.0.0.0", "--port", port]
-        logger.info(f"$PORT is set: binding 0.0.0.0:{port} for the platform proxy")
-    else:
-        logger.info("Starting pipecat runner HTTP server (http://localhost:7860)")
     main()
-    logger.info("Pipecat runner HTTP server stopped")
