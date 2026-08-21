@@ -184,12 +184,16 @@ async def bot(runner_args):
             ),
             # Twilio Media Streams use 8kHz audio. The serializer/add_wav_header
             # are set automatically by create_transport() for telephony.
+            #
+            # No vad_analyzer here: as of Pipecat 1.x, VAD lives on the user
+            # context aggregator (see LLMUserAggregatorParams below), not on
+            # transport params. TransportParams has no such field and pydantic
+            # would silently drop it, loading a Silero model for nothing.
             "twilio": lambda: FastAPIWebsocketParams(
                 audio_in_enabled=True,
                 audio_out_enabled=True,
                 audio_in_sample_rate=8000,
                 audio_out_sample_rate=8000,
-                vad_analyzer=SileroVADAnalyzer(),
             ),
         },
     )
@@ -272,19 +276,23 @@ if __name__ == "__main__":
 
     # Render (and most PaaS hosts) assign the listen port via $PORT and expect
     # the process to bind 0.0.0.0 so their proxy can reach it. The pipecat
-    # runner defaults to localhost:7860, which leaves the health check hanging
-    # until Render times the deploy out. Inject --host/--port ahead of parsing
-    # unless they were passed explicitly on the CLI.
+    # runner defaults to localhost:7860 and never reads $PORT, which leaves the
+    # health check hanging until Render times the deploy out.
     #
-    # Do not remove this block: reverting it is what made the deploy after
-    # 3421846 time out.
-    host = "0.0.0.0"
-    port = os.environ.get("PORT", "7860")
-    if "--host" not in sys.argv and "--port" not in sys.argv:
-        sys.argv += ["--host", host, "--port", port]
+    # This is gated on $PORT being set, which is true on Render and false on a
+    # dev machine. Locally the runner keeps its own default and prints a
+    # browsable http://localhost:7860 URL. Binding 0.0.0.0 locally works too,
+    # but the URL the runner then prints is not reachable in a browser:
+    # 0.0.0.0 is a bind-any address, not a destination, so Chrome rejects it
+    # with ERR_ADDRESS_INVALID.
+    #
+    # Do not remove the $PORT handling: dropping it is what made the deploy
+    # after 3421846 time out.
+    port = os.environ.get("PORT")
+    if port and "--host" not in sys.argv and "--port" not in sys.argv:
+        sys.argv += ["--host", "0.0.0.0", "--port", port]
+        logger.info(f"$PORT is set: binding 0.0.0.0:{port} for the platform proxy")
     else:
-        host, port = "(from CLI)", "(from CLI)"
-
-    logger.info(f"Starting pipecat runner HTTP server on {host}:{port}")
+        logger.info("Starting pipecat runner HTTP server (http://localhost:7860)")
     main()
     logger.info("Pipecat runner HTTP server stopped")
