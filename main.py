@@ -1,12 +1,18 @@
+import asyncio
 import os
+import uuid
+from pathlib import Path
 
 from deepagents import create_deep_agent
 from dotenv import load_dotenv
+from fastapi import HTTPException
+from fastapi.responses import FileResponse
 from langchain.messages import HumanMessage
 from langchain.tools import tool
 from langchain_core.runnables import RunnableLambda
 from loguru import logger
 from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.frames.frames import TTSSpeakFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -16,11 +22,14 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.frameworks.langchain import LangchainProcessor
+from pipecat.runner.livekit import generate_token, generate_token_with_agent
 from pipecat.runner.run import app
+from pipecat.runner.types import LiveKitRunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.livekit.transport import LiveKitParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 from llm_config import model
@@ -39,6 +48,57 @@ load_dotenv()
 async def health():
     """Liveness/readiness probe. Must never block or touch external services."""
     return {"status": "ok"}
+
+
+# --- LiveKit path: the transport that actually works behind Render ----------
+#
+# The built-in SmallWebRTC transport is peer-to-peer: the browser has to reach
+# this process directly over UDP for media. Render web services are only
+# reachable on 443/HTTPS and the container has no public IP, so the SDP
+# exchange succeeds (the UI says "connected") and then media never establishes.
+#
+# With LiveKit, both the browser and this process connect *outbound* to LiveKit
+# Cloud, which relays the media. Nothing needs to reach us on UDP, so it works
+# unchanged on Render. Requires LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET.
+
+# Keep strong references to in-flight bot tasks so they aren't garbage
+# collected mid-call.
+_bot_tasks: set[asyncio.Task] = set()
+
+
+@app.get("/livekit", include_in_schema=False)
+async def livekit_client_page():
+    """Serve the minimal browser client for the LiveKit path."""
+    return FileResponse(Path(__file__).parent / "livekit_client.html")
+
+
+@app.post("/livekit/connect", include_in_schema=False)
+async def livekit_connect():
+    """Create a room, start the bot in it, and return client credentials."""
+    url = os.environ.get("LIVEKIT_URL")
+    api_key = os.environ.get("LIVEKIT_API_KEY")
+    api_secret = os.environ.get("LIVEKIT_API_SECRET")
+    missing = _missing_env("LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET")
+    if missing:
+        detail = f"Missing environment variable(s): {', '.join(missing)}"
+        logger.error(detail)
+        raise HTTPException(status_code=503, detail=detail)
+
+    room_name = f"pipecatx-{uuid.uuid4().hex[:12]}"
+    agent_token = generate_token_with_agent(
+        room_name, "Pipecat Agent", api_key, api_secret
+    )
+    user_token = generate_token(room_name, "User", api_key, api_secret)
+
+    runner_args = LiveKitRunnerArguments(
+        room_name=room_name, url=url, token=agent_token
+    )
+    task = asyncio.create_task(bot(runner_args))
+    _bot_tasks.add(task)
+    task.add_done_callback(_bot_tasks.discard)
+
+    logger.info(f"LiveKit session requested, room={room_name}")
+    return {"url": url, "token": user_token, "room": room_name}
 
 
 @tool
@@ -96,6 +156,13 @@ async def bot(runner_args):
             ),
             # Twilio Media Streams use 8kHz audio. The serializer/add_wav_header
             # are set automatically by create_transport() for telephony.
+            # LiveKit relays media through LiveKit Cloud, so this is the
+            # transport to use on Render. See /livekit above.
+            "livekit": lambda: LiveKitParams(
+                audio_in_enabled=True, audio_out_enabled=True
+            ),
+            # Twilio Media Streams use 8kHz audio. The serializer/add_wav_header
+            # are set automatically by create_transport() for telephony.
             "twilio": lambda: FastAPIWebsocketParams(
                 audio_in_enabled=True,
                 audio_out_enabled=True,
@@ -137,17 +204,35 @@ async def bot(runner_args):
     )
     task = PipelineTask(pipeline)
 
-    # If "media connected" never appears in the log after the browser says it
-    # connected, the SDP exchange succeeded but the WebRTC media path did not:
-    # that is a network/ICE problem, not an application problem.
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info("media connected: audio is flowing, pipeline is live")
+    greeting = "Hi, I'm your voice assistant. What can I do for you?"
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info("media disconnected: cancelling pipeline task")
-        await task.cancel()
+    # LiveKitTransport and the WebRTC/websocket transports expose different
+    # event names, so register against whichever one we actually built.
+    if isinstance(runner_args, LiveKitRunnerArguments):
+
+        @transport.event_handler("on_first_participant_joined")
+        async def on_first_participant_joined(transport, participant_id):
+            logger.info(f"media connected: participant {participant_id} joined")
+            await task.queue_frame(TTSSpeakFrame(greeting))
+
+        @transport.event_handler("on_participant_disconnected")
+        async def on_participant_disconnected(transport, participant_id):
+            logger.info("media disconnected: cancelling pipeline task")
+            await task.cancel()
+
+    else:
+        # If "media connected" never appears after the browser says it
+        # connected, the SDP exchange succeeded but the WebRTC media path did
+        # not: that is a network/ICE problem, not an application problem.
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info("media connected: audio is flowing, pipeline is live")
+            await task.queue_frame(TTSSpeakFrame(greeting))
+
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info("media disconnected: cancelling pipeline task")
+            await task.cancel()
 
     logger.info("running pipeline, waiting for media to connect")
     await PipelineRunner(handle_sigint=runner_args.handle_sigint).run(task)
