@@ -95,7 +95,21 @@ async def livekit_connect():
     )
     task = asyncio.create_task(bot(runner_args))
     _bot_tasks.add(task)
-    task.add_done_callback(_bot_tasks.discard)
+
+    def _on_bot_done(finished: asyncio.Task) -> None:
+        # Without this, a crash inside bot() is discarded silently and the
+        # browser just sits in a room with no agent in it.
+        _bot_tasks.discard(finished)
+        if finished.cancelled():
+            logger.info(f"bot task cancelled, room={room_name}")
+            return
+        exc = finished.exception()
+        if exc:
+            logger.opt(exception=exc).error(f"bot task failed, room={room_name}")
+        else:
+            logger.info(f"bot task finished, room={room_name}")
+
+    task.add_done_callback(_on_bot_done)
 
     logger.info(f"LiveKit session requested, room={room_name}")
     return {"url": url, "token": user_token, "room": room_name}
@@ -116,7 +130,7 @@ agent = create_deep_agent(
 
 
 # Pipecat gives this function {"input": "what is the weather in New York?"}.
-# It returns one final string for Deepgram TTS to speak.
+# It returns one final string for the TTS service to speak.
 async def ask_deep_agent(data: dict[str, str]) -> str:
     result = await agent.ainvoke(
         {"messages": [HumanMessage(content=data["input"])]}
@@ -124,8 +138,17 @@ async def ask_deep_agent(data: dict[str, str]) -> str:
     return str(result["messages"][-1].content)
 
 
-# This is the small adapter between Pipecat and your Deep Agent.
-voice_agent = LangchainProcessor(RunnableLambda(ask_deep_agent))
+def make_voice_agent() -> LangchainProcessor:
+    """Build a fresh Pipecat <-> Deep Agent adapter for one session.
+
+    This must not be a module-level singleton. A FrameProcessor is stateful:
+    the pipeline links it to its neighbours and attaches a clock, a task
+    manager, and event handlers during setup. Reusing one instance across
+    sessions means the second caller re-links a processor that is still wired
+    into the first caller's pipeline. The Deep Agent itself is safe to share,
+    so only the processor is rebuilt.
+    """
+    return LangchainProcessor(RunnableLambda(ask_deep_agent))
 
 
 def _missing_env(*names: str) -> list[str]:
@@ -134,16 +157,16 @@ def _missing_env(*names: str) -> list[str]:
 
 
 async def bot(runner_args):
-    # bot() runs as a FastAPI background task, so an exception in here never
-    # reaches the browser: the client just sits there "connected" while nothing
-    # happens. .env is gitignored, so on Render these must be set in the
-    # dashboard's Environment section. Fail loudly in the log instead.
+    # bot() runs off to the side of the HTTP request, so an exception in here
+    # never reaches the browser: the client just sits there "connected" while
+    # nothing happens. .env is gitignored and never ships, so on any host these
+    # must be set in that platform's environment settings. Fail loudly instead.
     logger.info(f"bot task started ({type(runner_args).__name__})")
     missing = _missing_env("DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY")
     if missing:
         logger.error(
             "Cannot start the bot: missing environment variable(s) {}. "
-            "Set them in the Render dashboard (Environment) and redeploy.",
+            "Set them in your host's environment settings and redeploy.",
             ", ".join(missing),
         )
         return
@@ -154,10 +177,8 @@ async def bot(runner_args):
             "webrtc": lambda: TransportParams(
                 audio_in_enabled=True, audio_out_enabled=True
             ),
-            # Twilio Media Streams use 8kHz audio. The serializer/add_wav_header
-            # are set automatically by create_transport() for telephony.
             # LiveKit relays media through LiveKit Cloud, so this is the
-            # transport to use on Render. See /livekit above.
+            # transport to use on a PaaS host. See /livekit above.
             "livekit": lambda: LiveKitParams(
                 audio_in_enabled=True, audio_out_enabled=True
             ),
@@ -191,6 +212,9 @@ async def bot(runner_args):
         user_params=LLMUserAggregatorParams(vad_analyzer=SileroVADAnalyzer()),
     )
 
+    # One adapter per session. See make_voice_agent().
+    voice_agent = make_voice_agent()
+
     pipeline = Pipeline(
         [
             transport.input(),  # microphone audio
@@ -213,6 +237,9 @@ async def bot(runner_args):
         @transport.event_handler("on_first_participant_joined")
         async def on_first_participant_joined(transport, participant_id):
             logger.info(f"media connected: participant {participant_id} joined")
+            # LangchainProcessor passes this through as the chain's session_id.
+            # Without it every session shares a None key.
+            voice_agent.set_participant_id(participant_id)
             await task.queue_frame(TTSSpeakFrame(greeting))
 
         @transport.event_handler("on_participant_disconnected")
