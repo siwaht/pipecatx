@@ -1,0 +1,68 @@
+# DigitalOcean App Platform spec.
+#
+# Optional: you can configure all of this in the dashboard instead. Keeping it
+# in the repo means the deployment is reviewable and reproducible. Import it
+# with:  doctl apps create --spec .do/app.yaml
+# or update an existing app with: doctl apps update <app-id> --spec .do/app.yaml
+#
+# IMPORTANT: App Platform only accepts inbound HTTPS on 443. The peer-to-peer
+# SmallWebRTC transport at "/" will not carry audio here, exactly as on Render.
+# Use the /livekit route in this environment.
+
+name: pipecatx
+region: nyc
+
+services:
+  - name: web
+    dockerfile_path: Dockerfile
+    source_dir: /
+
+    github:
+      repo: siwaht/pipecatx
+      branch: main
+      deploy_on_push: true
+
+    # Silero VAD plus the smart-turn ONNX model load per connection; 512 MB is
+    # tight. Start at 1 GB and scale from measured usage.
+    instance_size_slug: basic-s
+    instance_count: 1
+
+    http_port: 8080
+
+    health_check:
+      # Answers immediately and touches no external service, so a cold or
+      # misconfigured deploy still passes readiness instead of timing out.
+      http_path: /healthz
+      initial_delay_seconds: 30
+      period_seconds: 15
+      timeout_seconds: 5
+      failure_threshold: 3
+
+    envs:
+      # Set the actual values as SECRET type in the dashboard, or with
+      # `doctl apps update`. Never commit real keys.
+      - key: DEEPGRAM_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: ELEVENLABS_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: ELEVENLABS_VOICE_ID
+        scope: RUN_TIME
+        value: JBFqnCBsd6RMkjVDRZzb
+      - key: CLOUDFLARE_ACCOUNT_ID
+        scope: RUN_TIME
+        type: SECRET
+      - key: CLOUDFLARE_API_TOKEN
+        scope: RUN_TIME
+        type: SECRET
+      # Required for the /livekit route, which is the transport that works here.
+      - key: LIVEKIT_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: LIVEKIT_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: LIVEKIT_API_SECRET
+        scope: RUN_TIME
+        type: SECRET
