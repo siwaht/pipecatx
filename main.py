@@ -111,6 +111,16 @@ async def bot(runner_args):
 
 
 if __name__ == "__main__":
+    import sys
+
     from pipecat.runner.run import main
+
+    # Render (and most PaaS hosts) assign the listen port via $PORT and expect
+    # the process to bind 0.0.0.0 so their proxy can reach it. The pipecat
+    # runner defaults to localhost:7860, which would leave health checks
+    # hanging until Render times the deploy out. Inject --host/--port ahead
+    # of parsing unless the user already passed them explicitly on the CLI.
+    if "--host" not in sys.argv and "--port" not in sys.argv:
+        sys.argv += ["--host", "0.0.0.0", "--port", os.environ.get("PORT", "7860")]
 
     main()
