@@ -1,0 +1,138 @@
+Copy and paste this into the other application:
+
+```text
+I have an existing Pipecat voice agent repository. Make it run reliably on Replit with a browser voice interface.
+
+Important: preserve the existing core AI pipeline and configuration:
+Deepgram STT → LangChain DeepAgent / Cloudflare Workers AI LLM → ElevenLabs TTS.
+
+Do not replace Pipecat with a different voice-agent framework. Do not hardcode secrets. Use Replit Secrets / environment variables only.
+
+The environment has these secret names available:
+- DEEPGRAM_API_KEY
+- ELEVENLABS_API_KEY
+- LIVEKIT_URL
+- LIVEKIT_API_KEY
+- LIVEKIT_API_SECRET
+- CLOUDFLARE_ACCOUNT_ID
+- CLOUDFLARE_API_TOKEN
+- SESSION_SECRET
+
+## Why LiveKit is required
+
+Do NOT use Pipecat’s Small WebRTC browser transport in Replit Preview. It can complete signaling but gets permanently stuck at “Connecting” because ICE/media traffic does not work reliably behind Replit’s proxied Preview environment.
+
+Use LiveKit only as the browser media transport. Pipecat must still run the agent pipeline.
+
+## Required implementation
+
+### 1. Restore/add Pipecat LiveKit support
+
+Update the Python dependencies and lockfile so the installed Pipecat version includes LiveKit transport/runner support, alongside the existing Deepgram and ElevenLabs integrations.
+
+Keep dependency versions compatible with the current project. Update:
+- pyproject.toml
+- requirements.txt, if the repository uses it
+- uv.lock
+
+### 2. Update the Python application
+
+In `main.py`:
+
+- Keep the existing Deepgram STT, LangChain DeepAgent / Cloudflare LLM, and ElevenLabs TTS pipeline.
+- Replace the direct browser/Small WebRTC transport with Pipecat’s LiveKit transport and runner.
+- Run the app as a FastAPI/HTTP server bound to `0.0.0.0` and the `PORT` environment variable.
+- Provide `GET /healthz`, returning a successful JSON health response.
+- Serve the browser client at `GET /livekit`.
+- Add an endpoint such as `POST /livekit/connect` that:
+  1. creates a unique LiveKit room name,
+  2. creates a signed LiveKit participant access token using `LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET`,
+  3. starts the Pipecat LiveKit bot task for that room using Pipecat’s LiveKit runner,
+  4. returns the room name, LiveKit URL, and browser participant token as JSON.
+
+The browser and agent must join the same room.
+
+The Pipecat pipeline must use:
+- Deepgram for speech-to-text,
+- the existing DeepAgent/Cloudflare model logic for responses,
+- ElevenLabs for text-to-speech,
+- LiveKit for incoming microphone audio and outgoing agent audio.
+
+Log useful operational events without logging secrets:
+- room/task startup,
+- agent joining/leaving,
+- transcribed user speech,
+- DeepAgent request duration,
+- errors.
+
+### 3. Reduce the end-of-turn response delay
+
+Do not use Pipecat SmartTurn as the user-turn stop strategy. It caused roughly three seconds of delay after the user had finished speaking, and users frequently began speaking again before the response started.
+
+Use Pipecat’s transcript-aware speech timeout strategy instead:
+
+```python
+SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.4)
+```
+
+Use this in the user turn aggregation / turn-detection configuration so the LLM begins responding promptly after approximately 0.4 seconds of silence.
+
+### 4. Add a lightweight browser client
+
+Create `livekit_client.html`, served by `/livekit`.
+
+It should:
+
+- Load the LiveKit browser client library.
+- Present a simple voice-agent interface with:
+  - a status label,
+  - Connect button,
+  - Disconnect button,
+  - short instructions/error area.
+- On Connect:
+  1. call `/livekit/connect`,
+  2. connect to the returned LiveKit URL with the returned token,
+  3. request microphone access,
+  4. publish microphone audio,
+  5. subscribe to the Pipecat agent’s remote audio track,
+  6. attach agent audio to an HTML audio element and autoplay it.
+- On Disconnect:
+  - stop local tracks,
+  - disconnect the room,
+  - reset UI state to Idle.
+- Show clear connection states, including:
+  - Idle
+  - Connecting
+  - Connected
+  - Disconnected
+  - Error
+- Handle browsers or automated environments with no microphone gracefully. The interface should still connect and show a clear message such as “Connected, but no microphone was found,” rather than crashing or remaining stuck.
+- Never expose LiveKit API secret or any other secret in browser code.
+
+### 5. Replit Preview integration
+
+If the repository has a separate React/Vite preview application, change its embedded preview/iframe URL to load the backend’s `/livekit` page rather than Pipecat’s old `/client/` or Small WebRTC interface.
+
+Use the correct proxied/backend URL for Replit. Do not hardcode localhost into browser code.
+
+The backend run command should work as:
+
+```bash
+uv run python main.py
+```
+
+### 6. Verification required
+
+Verify all of the following after implementation:
+
+1. The backend starts cleanly.
+2. `GET /healthz` succeeds.
+3. `POST /livekit/connect` returns a valid room, token, and URL.
+4. The Pipecat bot connects to the generated LiveKit room.
+5. The browser reaches Connected state rather than being stuck at Connecting.
+6. In a browser without a microphone, the interface shows a meaningful no-microphone message and Disconnect works cleanly.
+7. With a microphone, speaking is transcribed by Deepgram, sent through the existing DeepAgent, and returned as ElevenLabs audio.
+8. The agent begins responding quickly after the user stops speaking, using the 0.4-second speech timeout rather than SmartTurn’s longer delay.
+
+Do not add unrelated Replit artifact files, generated mockups, backup folders, or workspace scaffolding to the original repository. Keep the change focused on the Pipecat application and its browser client.
+```
